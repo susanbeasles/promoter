@@ -203,11 +203,15 @@ async function followups(api: Api, deps: PromotionDeps, record: ShadowRecord, pr
       ].join('\n'),
     ),
   );
-  await attempt('close', async () => {
-    const pull = await gh.getPull(api, record.pr);
-    if (pull.state === 'open') await gh.closePull(api, record.pr);
-  });
-  await attempt('cleanup', () => gh.deleteBranch(api, shadowBranch(record.pr)));
+  // Provenance first: while the tag is missing the pull request stays open (the visible sign that the promotion is
+  // unfinished, and the only state in which the authorizer will authorize a retry) and the shadow branch stays.
+  if (!pending.includes('tag')) {
+    await attempt('close', async () => {
+      const pull = await gh.getPull(api, record.pr);
+      if (pull.state === 'open') await gh.closePull(api, record.pr);
+    });
+    await attempt('cleanup', () => gh.deleteBranch(api, shadowBranch(record.pr)));
+  }
   const updated: ShadowRecord = { ...record, tag, pending };
   deps.store.put(updated);
   return updated;

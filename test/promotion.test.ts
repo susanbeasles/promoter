@@ -248,15 +248,33 @@ test('follow-up failures after main moved stay pending and are retried; the prom
   assert.equal(h.deps.store.pendingFollowups().length, 0);
 });
 
-test('an existing tag pointing at another commit is never moved; the tag step stays pending', async () => {
+test('while the provenance tag is missing the PR stays open and the shadow branch stays; the retry finishes in order', async () => {
+  const h = harness();
+  const p = await prepared(h);
+  h.gh.fail('POST', /\/git\/tags$/, 502);
+  const r = await promote(promoteRequest(p.candidate_sha, h.head), h.deps);
+  assert.equal(r.ok, true);
+  if (!r.ok || r.action !== 'promote') return;
+  assert.deepEqual([...r.pending].sort(), ['cleanup', 'close', 'tag']);
+  assert.equal(h.gh.branch('main'), p.candidate_sha);
+  assert.equal(h.gh.pulls.get(7)?.state, 'open', 'not closed without provenance');
+  assert.equal(h.gh.branch('shadow/pr-7'), p.candidate_sha);
+  assert.equal(await reconcileAll(REPO, h.deps), 0);
+  assert.equal(h.gh.tags.size, 1);
+  assert.equal(h.gh.pulls.get(7)?.state, 'closed');
+  assert.equal(h.gh.branch('shadow/pr-7'), undefined);
+});
+
+test('an existing tag pointing at another commit is never moved; the tag step stays pending and the PR stays open', async () => {
   const h = harness();
   const p = await prepared(h);
   const tag = tagName(7, p.candidate_sha);
   h.gh.refs.set(`tags/${tag}`, { type: 'commit', sha: h.main });
   const r = await promote(promoteRequest(p.candidate_sha, h.head), h.deps);
   assert.equal(r.ok, true);
-  if (r.ok && r.action === 'promote') assert.deepEqual(r.pending, ['tag']);
+  if (r.ok && r.action === 'promote') assert.deepEqual([...r.pending].sort(), ['cleanup', 'close', 'tag']);
   assert.equal(h.gh.refs.get(`tags/${tag}`)?.sha, h.main);
+  assert.equal(h.gh.pulls.get(7)?.state, 'open', 'a blocked provenance tag keeps the pull request open for a human');
 });
 
 test('the promoter never sends force: true to main, never writes outside the repo, and never logs the token', async () => {

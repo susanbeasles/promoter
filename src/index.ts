@@ -6,7 +6,7 @@ import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers';
 import type { Env as ConfigEnv } from './config.ts';
 import { createDeps, KeyCache, type CommonDeps } from './deps.ts';
 import { InstallationTokenCache } from './github-app.ts';
-import { prepare, promote, retryFollowups, type Prepared, type Promoted, type PromotionDeps } from './promotion.ts';
+import { prepare, promote, reconcileAll, type Prepared, type Promoted, type PromotionDeps } from './promotion.ts';
 import { refusal, toRefusal, type Refusal } from './refusal.ts';
 import { validateRequest, type PromotionRequest } from './request.ts';
 import { SqlShadowStore } from './store.ts';
@@ -45,6 +45,10 @@ export class PromotionLedger extends DurableObject<Env> {
       clock: common.clock,
       ownerId: common.config().ownerId,
       store: new SqlShadowStore(this.ctx.storage.sql, repoId),
+      schedule: async (atMs) => {
+        const current = await this.ctx.storage.getAlarm();
+        if (current === null || current > atMs) await this.ctx.storage.setAlarm(atMs);
+      },
     };
   }
 
@@ -68,7 +72,7 @@ export class PromotionLedger extends DurableObject<Env> {
       const repo = await this.ctx.storage.get<string>('repo');
       const repoId = await this.ctx.storage.get<number>('repo_id');
       if (repo === undefined || repoId === undefined) return;
-      const remaining = await retryFollowups(repo, this.#deps(repoId));
+      const remaining = await reconcileAll(repo, this.#deps(repoId));
       if (remaining > 0) await this.ctx.storage.setAlarm(Date.now() + RETRY_MS);
     });
   }

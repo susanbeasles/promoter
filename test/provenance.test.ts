@@ -16,6 +16,7 @@ const record: ShadowRecord = {
   promoted_at: '2026-10-15T12:05:00.000Z',
   tag: null,
   pending: [],
+  evidence: null,
 };
 
 test('tag names are stable and short', () => {

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { candidateMessage, prepare, promote, retryFollowups, shadowBranch } from '../src/promotion.ts';
+import { candidateMessage, prepare, promote, reconcileAll, shadowBranch } from '../src/promotion.ts';
 import { readTagMessage, tagName } from '../src/provenance.ts';
 import { OWNER_ID, REPO, REPO_ID, treeSha } from './fake-github.ts';
 import { harness, prepareRequest, promoteRequest, TOKEN } from './helpers.ts';
@@ -178,7 +178,7 @@ test('stale base: main moved after prepare, the promoter rebuilds and hands back
   assert.equal(h.gh.branch('main'), r.candidate_sha);
 });
 
-test('race: main moves between the check and the update; GitHub refuses the non-fast-forward', async () => {
+test('race: main moves after the first check; the final head recheck refuses and nothing is promoted', async () => {
   const h = harness();
   const p = await prepared(h);
   h.gh.after = (call) => {
@@ -188,8 +188,26 @@ test('race: main moves between the check and the update; GitHub refuses the non-
     }
   };
   const r = await promote(promoteRequest(p.candidate_sha), h.deps);
+  assert.equal(!r.ok && r.code, 'stale_base');
+  assert.notEqual(h.gh.branch('main'), p.candidate_sha);
+  assert.equal(h.deps.store.get(7)?.state, 'prepared', 'intent withdrawn');
+  assert.equal(h.deps.store.get(7)?.evidence, null);
+});
+
+test('race after the final recheck: GitHub refuses the non-fast-forward update', async () => {
+  const h = harness();
+  const p = await prepared(h);
+  let mainReads = 0;
+  h.gh.after = (call) => {
+    if (call.method === 'GET' && call.path.endsWith('/git/ref/heads/main') && ++mainReads === 2) {
+      h.gh.refs.set('heads/main', { type: 'commit', sha: h.gh.commit('tree-race', [h.main], 'race') });
+      h.gh.after = undefined;
+    }
+  };
+  const r = await promote(promoteRequest(p.candidate_sha), h.deps);
   assert.equal(!r.ok && r.code, 'not_fast_forward');
   assert.notEqual(h.gh.branch('main'), p.candidate_sha);
+  assert.equal(h.deps.store.get(7)?.state, 'prepared');
 });
 
 test('readback mismatch is reported, not assumed', async () => {
@@ -213,7 +231,7 @@ test('follow-up failures after main moved stay pending and are retried; the prom
   assert.deepEqual([...r.pending].sort(), ['cleanup', 'comment']);
   assert.equal(h.gh.branch('main'), p.candidate_sha);
   assert.equal(h.deps.store.pendingFollowups().length, 1);
-  const remaining = await retryFollowups(REPO, h.deps);
+  const remaining = await reconcileAll(REPO, h.deps);
   assert.equal(remaining, 0);
   assert.equal(h.gh.comments.length, 1);
   assert.equal(h.gh.branch('shadow/pr-7'), undefined);
@@ -235,12 +253,130 @@ test('the promoter never sends force: true to main, never writes outside the rep
   const h = harness();
   const p = await prepared(h);
   await promote(promoteRequest(p.candidate_sha), h.deps);
-  for (const c of h.gh.calls) {
+  for (const c of h.gh.calls.filter((call) => call.method !== 'SCHEDULE')) {
     assert.ok(c.path.startsWith(`/repos/${REPO}/`), c.path);
     if (c.method === 'PATCH' && c.path.endsWith('/heads/main')) assert.equal((c.body as { force: boolean }).force, false);
   }
   assert.ok(!JSON.stringify(h.logs).includes(TOKEN));
   assert.ok(h.logs.some((l) => l['event'] === 'promote' && l['outcome'] === 'promoted'));
+});
+
+test('intent and evidence are durable and reconciliation is armed before main moves', async () => {
+  const h = harness();
+  const p = await prepared(h);
+  let stateAtUpdate: string | undefined;
+  h.gh.after = (call) => {
+    if (call.method === 'PATCH' && call.path.endsWith('/heads/main')) stateAtUpdate = h.deps.store.get(7)?.state;
+  };
+  await promote(promoteRequest(p.candidate_sha), h.deps);
+  const order = h.gh.calls.map((c) => c.method + ' ' + c.path.replace(/^.*\/git\//, ''));
+  assert.ok(order.indexOf('SCHEDULE ') < order.indexOf('PATCH refs/heads/main'), order.join('\n'));
+  assert.equal(stateAtUpdate, 'advancing');
+  assert.equal(h.scheduled.length, 1);
+});
+
+test('crash after main advanced, before the tag: reconciliation completes from the persisted evidence only', async () => {
+  const h = harness();
+  const p = await prepared(h);
+  // The update lands, then the process dies: every later call in this request fails.
+  h.gh.after = (call) => {
+    if (call.method === 'PATCH' && call.path.endsWith('/heads/main')) h.gh.fail('GET', /.*/, 599, true);
+  };
+  const crashed = await promote(promoteRequest(p.candidate_sha), h.deps);
+  assert.equal(crashed.ok, false);
+  assert.equal(h.gh.branch('main'), p.candidate_sha, 'main moved');
+  assert.equal(h.deps.store.get(7)?.state, 'advancing');
+  assert.equal(h.gh.refs.get(`tags/${tagName(7, p.candidate_sha)}`), undefined, 'no tag yet');
+  h.gh.failures = [];
+  h.gh.after = undefined;
+  // A later request arrives with different evidence: it must not change what the tag says.
+  const other = promoteRequest(p.candidate_sha);
+  const forged = { ...other, evidence: { ...other.evidence, shadow_run_id: 999, decision_id: 'dec_forged_later_0001' } };
+  const repeat = await promote(forged, h.deps);
+  assert.equal(repeat.ok, true);
+  if (repeat.ok && repeat.action === 'promote') {
+    assert.equal(repeat.already_promoted, true);
+    assert.equal(repeat.main_sha, p.candidate_sha);
+  }
+  const ref = h.gh.refs.get(`tags/${tagName(7, p.candidate_sha)}`);
+  const provenance = await readTagMessage(h.gh.tags.get(ref!.sha)!.message);
+  assert.equal(provenance?.['shadow_run_id'], 555, 'tag built from the evidence persisted before main moved');
+  assert.equal(provenance?.['authorizer_decision'], 'dec_0123456789abcdef');
+  assert.equal(provenance?.['candidate_sha'], p.candidate_sha);
+  assert.equal(h.gh.tags.size, 1);
+  assert.equal(h.deps.store.get(7)?.state, 'promoted');
+});
+
+test('crash after main advanced: the alarm alone completes the promotion', async () => {
+  const h = harness();
+  const p = await prepared(h);
+  h.gh.after = (call) => {
+    if (call.method === 'PATCH' && call.path.endsWith('/heads/main')) h.gh.fail('GET', /.*/, 599, true);
+  };
+  await promote(promoteRequest(p.candidate_sha), h.deps);
+  h.gh.failures = [];
+  h.gh.after = undefined;
+  assert.equal(await reconcileAll(REPO, h.deps), 0);
+  assert.equal(h.deps.store.get(7)?.state, 'promoted');
+  assert.ok(h.gh.refs.get(`tags/${tagName(7, p.candidate_sha)}`));
+  assert.equal(h.gh.pulls.get(7)?.state, 'closed');
+});
+
+test('update outcome unknown and not applied: reconciliation reverts and a fresh authorization retries', async () => {
+  const h = harness();
+  const p = await prepared(h);
+  h.gh.fail('PATCH', /\/git\/refs\/heads\/main$/, 504);
+  const r = await promote(promoteRequest(p.candidate_sha), h.deps);
+  assert.equal(!r.ok && r.code, 'api_error');
+  assert.equal(h.deps.store.get(7)?.state, 'advancing');
+  assert.equal(await reconcileAll(REPO, h.deps), 0);
+  assert.equal(h.deps.store.get(7)?.state, 'prepared');
+  assert.equal(h.deps.store.get(7)?.evidence, null);
+  const retried = await promote(promoteRequest(p.candidate_sha), h.deps);
+  assert.equal(retried.ok, true);
+  assert.equal(h.gh.branch('main'), p.candidate_sha);
+});
+
+test('advancing with main somewhere else is a conflict: no tag, no adoption, refusals until a human acts', async () => {
+  const h = harness();
+  const p = await prepared(h);
+  h.gh.fail('PATCH', /\/git\/refs\/heads\/main$/, 504);
+  await promote(promoteRequest(p.candidate_sha), h.deps);
+  h.gh.refs.set('heads/main', { type: 'commit', sha: h.gh.commit('tree-elsewhere', [h.main], 'elsewhere') });
+  await reconcileAll(REPO, h.deps);
+  assert.equal(h.deps.store.get(7)?.state, 'reconcile_conflict');
+  assert.equal(h.gh.tags.size, 0);
+  const again = await promote(promoteRequest(p.candidate_sha), h.deps);
+  assert.equal(!again.ok && again.code, 'reconcile_conflict');
+  const reprep = await prepare(prepareRequest(h.head), h.deps);
+  assert.equal(!reprep.ok && reprep.code, 'reconcile_conflict');
+  assert.ok(h.logs.some((l) => l['outcome'] === 'conflict' && l['severity'] === 'critical'));
+});
+
+test('main at the candidate without a recorded intent is never adopted', async () => {
+  const h = harness();
+  const p = await prepared(h);
+  h.gh.refs.set('heads/main', { type: 'commit', sha: p.candidate_sha });
+  const r = await promote(promoteRequest(p.candidate_sha), h.deps);
+  assert.equal(!r.ok && r.code, 'reconcile_conflict');
+  assert.equal(h.gh.tags.size, 0);
+});
+
+test('prepare while a promotion is in flight settles it first and never builds a second candidate', async () => {
+  const h = harness();
+  const p = await prepared(h);
+  h.gh.after = (call) => {
+    if (call.method === 'PATCH' && call.path.endsWith('/heads/main')) h.gh.fail('GET', /.*/, 599, true);
+  };
+  await promote(promoteRequest(p.candidate_sha), h.deps);
+  h.gh.failures = [];
+  h.gh.after = undefined;
+  h.gh.pulls.get(7)!.state = 'open';
+  const commitsBefore = h.gh.commits.size;
+  const r = await prepare(prepareRequest(h.head), h.deps);
+  assert.equal(!r.ok && r.code, 'already_promoted');
+  assert.equal(h.gh.commits.size, commitsBefore);
+  assert.equal(h.deps.store.get(7)?.state, 'promoted');
 });
 
 test('candidate message bounds the body and keeps trailers', () => {

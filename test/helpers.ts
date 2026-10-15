@@ -26,6 +26,7 @@ export function sqlite(): SqlLike {
 }
 
 export interface Harness {
+  scheduled: number[];
   gh: FakeGitHub;
   deps: PromotionDeps;
   logs: Record<string, unknown>[];
@@ -38,7 +39,12 @@ export function harness(): Harness {
   const logs: Record<string, unknown>[] = [];
   const logger: Logger = { log: (event) => logs.push(JSON.parse(JSON.stringify(event))), register: () => undefined };
   let now = Date.parse('2026-10-15T12:00:00Z');
+  const scheduled: number[] = [];
   const deps: PromotionDeps = {
+    schedule: async (atMs) => {
+      scheduled.push(atMs);
+      gh.calls.push({ method: 'SCHEDULE', path: '', body: null, auth: null });
+    },
     fetcher: gh.fetcher,
     token: async (repoId) => {
       if (repoId !== REPO_ID) throw new Error('token for wrong repo');
@@ -49,7 +55,7 @@ export function harness(): Harness {
     ownerId: OWNER_ID,
     logger,
   };
-  return { gh, deps, logs, main, head };
+  return { gh, deps, logs, main, head, scheduled };
 }
 
 export const prepareRequest = (headSha: string, pr = 7): PrepareRequest => ({

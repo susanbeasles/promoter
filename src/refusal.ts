@@ -35,6 +35,8 @@ export type PromotionCode =
   | 'tree_mismatch'
   | 'not_fast_forward'
   | 'readback_mismatch'
+  | 'already_promoted'
+  | 'reconcile_conflict'
   | 'api_error';
 
 export type RefusalCode = RequestCode | ConfigCode | PromotionCode | 'internal';

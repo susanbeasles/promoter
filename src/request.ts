@@ -136,6 +136,11 @@ function attestation(value: unknown): AttestationEvidence {
   return Object.freeze({ digest, bundle_url: url });
 }
 
+/** Parse evidence: used for requests and for the copy the promoter persisted before moving `main`. */
+export function parseEvidence(value: unknown): Evidence {
+  return evidence(value);
+}
+
 function evidence(value: unknown): Evidence {
   if (!isPlainObject(value)) refuse('bad_evidence');
   exactKeys(value, ['checks', 'attestations', 'shadow_run_id', 'decision_id'], [], 'bad_evidence');

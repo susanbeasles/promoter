@@ -7,7 +7,8 @@ import type { Fetcher } from './http.ts';
 import type { Logger } from './log.ts';
 import { tagMessage, tagName } from './provenance.ts';
 import { refusal, refuse, toRefusal, type Refusal } from './refusal.ts';
-import type { PrepareRequest, PromoteRequest } from './request.ts';
+import { parseEvidence, type Evidence, type PrepareRequest, type PromoteRequest } from './request.ts';
+import { canonicalJson, type JsonValue } from './json.ts';
 import type { ShadowRecord, ShadowStore } from './store.ts';
 
 export const MAIN = 'main';
@@ -25,7 +26,12 @@ export interface PromotionDeps {
   readonly clock: () => number;
   readonly ownerId: number;
   readonly logger: Logger;
+  /** Arm reconciliation (the Durable Object alarm) no later than `atMs`. */
+  readonly schedule: (atMs: number) => Promise<void>;
 }
+
+/** How soon an in-flight `main` update is reconciled if the request that started it never returns. */
+export const RECONCILE_AFTER_MS = 2 * 60_000;
 
 export interface Prepared {
   readonly ok: true;
@@ -98,6 +104,7 @@ async function buildCandidate(api: Api, deps: PromotionDeps, pull: gh.PullView, 
     promoted_at: null,
     tag: null,
     pending: [],
+    evidence: null,
   };
   deps.store.put(record);
   return record;
@@ -109,7 +116,15 @@ export async function prepare(request: PrepareRequest, deps: PromotionDeps): Pro
     const api: Api = { fetcher: deps.fetcher, token: await deps.token(repoId), repo };
     const pull = await gh.getPull(api, pr);
     checkPull(pull, repoId, deps.ownerId, headSha);
-    const recorded = deps.store.get(pr);
+    let recorded = deps.store.get(pr);
+    if (recorded?.state === 'advancing') {
+      // A promotion of this PR may be in flight: settle it before building anything new.
+      const settled = await reconcile(api, deps, recorded);
+      if (settled.kind !== 'reverted') refuse(settled.kind === 'promoted' ? 'already_promoted' : 'reconcile_conflict');
+      recorded = deps.store.get(pr);
+    }
+    if (recorded?.state === 'promoted') refuse('already_promoted');
+    if (recorded?.state === 'reconcile_conflict') refuse('reconcile_conflict');
     if (recorded !== undefined && recorded.state === 'prepared' && recorded.head_sha === headSha) {
       // Same head, same base, shadow branch still at the candidate: nothing to rebuild.
       const [main, shadow] = await Promise.all([gh.getBranch(api, MAIN), gh.getBranch(api, shadowBranch(pr))]);
@@ -138,46 +153,41 @@ function prepared(record: ShadowRecord, reused: boolean): Prepared {
   };
 }
 
+/** Evidence persisted with the record. A promoted record always has it: it is written before `main` moves. */
+function persistedEvidence(record: ShadowRecord): Evidence {
+  if (record.evidence === null) refuse('api_error', 'record has no persisted evidence');
+  return parseEvidence(JSON.parse(record.evidence) as unknown);
+}
+
 /** Run the steps that follow a successful fast-forward. Each is idempotent; failures stay pending. */
-async function followups(api: Api, deps: PromotionDeps, record: ShadowRecord, request: PromoteRequest | undefined, prTitle: string): Promise<ShadowRecord> {
+async function followups(api: Api, deps: PromotionDeps, record: ShadowRecord, prTitle: string): Promise<ShadowRecord> {
   let pending = [...record.pending] as Followup[];
-  let tag = record.tag ?? tagName(record.pr, record.candidate_sha);
-  const done = (step: Followup): void => {
-    pending = pending.filter((p) => p !== step);
-  };
+  const tag = record.tag ?? tagName(record.pr, record.candidate_sha);
   const attempt = async (step: Followup, run: () => Promise<void>): Promise<void> => {
     if (!pending.includes(step)) return;
     try {
       await run();
-      done(step);
+      pending = pending.filter((p) => p !== step);
     } catch (error) {
       const r = toRefusal(error);
       deps.logger.log({ event: 'promote.followup', repo: api.repo, pr: record.pr, step, outcome: 'failed', code: r.code, detail: r.detail });
     }
   };
+  const pointsAtCandidate = async (): Promise<boolean | undefined> => {
+    const ref = await gh.getTagRef(api, tag);
+    if (ref === undefined) return undefined;
+    const target = ref.type === 'tag' ? await gh.getTagTarget(api, ref.sha) : ref.sha;
+    if (target !== record.candidate_sha) refuse('api_error', `tag ${tag} points elsewhere`);
+    return true;
+  };
   await attempt('tag', async () => {
-    const existing = await gh.getTagRef(api, tag);
-    if (existing !== undefined) {
-      const target = existing.type === 'tag' ? await gh.getTagTarget(api, existing.sha) : existing.sha;
-      if (target !== record.candidate_sha) refuse('api_error', `tag ${tag} points elsewhere`);
-      return;
-    }
-    if (request === undefined) refuse('api_error', 'tag evidence unavailable; repeat the promote request');
-    const { message } = await tagMessage({
-      repo: api.repo,
-      record,
-      prTitle,
-      evidence: request.evidence,
-      promotedAt: record.promoted_at ?? iso(deps.clock()),
-      promoterVersion: PROMOTER_VERSION,
-    });
+    if ((await pointsAtCandidate()) === true) return;
+    const evidence = persistedEvidence(record);
+    const { message } = await tagMessage({ repo: api.repo, record, prTitle, evidence, promotedAt: record.promoted_at ?? iso(deps.clock()), promoterVersion: PROMOTER_VERSION });
     const object = await gh.createAnnotatedTag(api, tag, message, record.candidate_sha);
-    if ((await gh.createTagRef(api, tag, object)) === 'exists') {
-      const again = await gh.getTagRef(api, tag);
-      const target = again?.type === 'tag' ? await gh.getTagTarget(api, again.sha) : again?.sha;
-      if (target !== record.candidate_sha) refuse('api_error', `tag ${tag} points elsewhere`);
-    }
+    if ((await gh.createTagRef(api, tag, object)) === 'exists') await pointsAtCandidate();
   });
+  const runId = record.evidence === null ? undefined : persistedEvidence(record).shadow_run_id;
   await attempt('comment', () =>
     gh.comment(
       api,
@@ -187,12 +197,10 @@ async function followups(api: Api, deps: PromotionDeps, record: ShadowRecord, re
         '',
         `Provenance tag: \`${tag}\``,
         `Pull request head: ${record.head_sha}`,
-        request === undefined ? '' : `Candidate pipeline run: https://github.com/${api.repo}/actions/runs/${request.evidence.shadow_run_id}`,
+        ...(runId === undefined ? [] : [`Candidate pipeline run: https://github.com/${api.repo}/actions/runs/${runId}`]),
         '',
         'The squash commit on `main` is the exact tree that passed the pipeline on the shadow branch, so this pull request is closed rather than merged.',
-      ]
-        .filter((line, i, all) => line !== '' || (i > 0 && all[i - 1] !== ''))
-        .join('\n'),
+      ].join('\n'),
     ),
   );
   await attempt('close', async () => {
@@ -200,32 +208,73 @@ async function followups(api: Api, deps: PromotionDeps, record: ShadowRecord, re
     if (pull.state === 'open') await gh.closePull(api, record.pr);
   });
   await attempt('cleanup', () => gh.deleteBranch(api, shadowBranch(record.pr)));
-  tag = record.tag ?? tag;
   const updated: ShadowRecord = { ...record, tag, pending };
   deps.store.put(updated);
   return updated;
 }
 
-export async function promote(request: PromoteRequest, deps: PromotionDeps): Promise<Promoted | Refusal> {
+type Settled = { readonly kind: 'promoted'; readonly record: ShadowRecord } | { readonly kind: 'reverted' } | { readonly kind: 'conflict'; readonly main: string };
+
+/**
+ * Settle an `advancing` record from what `main` actually is (ADR-0002 section 5). Never moves `main` and never
+ * uses any evidence but the copy persisted before the update.
+ */
+async function reconcile(api: Api, deps: PromotionDeps, record: ShadowRecord): Promise<Settled> {
+  const main = await gh.getBranch(api, MAIN);
+  if (main === record.candidate_sha) {
+    const promoted: ShadowRecord = { ...record, state: 'promoted', promoted_at: record.promoted_at ?? iso(deps.clock()), tag: tagName(record.pr, record.candidate_sha), pending: [...FOLLOWUPS] };
+    deps.store.put(promoted);
+    const pull = await gh.getPull(api, record.pr);
+    const done = await followups(api, deps, promoted, pull.title);
+    deps.logger.log({ event: 'promote.reconcile', repo: api.repo, pr: record.pr, candidate_sha: record.candidate_sha, outcome: 'completed', pending: done.pending.join(',') });
+    return { kind: 'promoted', record: done };
+  }
+  if (main === record.base_sha) {
+    deps.store.put({ ...record, state: 'prepared', evidence: null });
+    deps.logger.log({ event: 'promote.reconcile', repo: api.repo, pr: record.pr, candidate_sha: record.candidate_sha, outcome: 'reverted' });
+    return { kind: 'reverted' };
+  }
+  deps.store.put({ ...record, state: 'reconcile_conflict' });
+  deps.logger.log({ event: 'promote.reconcile', repo: api.repo, pr: record.pr, candidate_sha: record.candidate_sha, outcome: 'conflict', main_sha: main ?? 'none', severity: 'critical' });
+  return { kind: 'conflict', main: main ?? 'none' };
+}
+
+function promotedResult(record: ShadowRecord, already: boolean): Promoted {
+  return { ok: true, status: 200, action: 'promote', main_sha: record.candidate_sha, tag: record.tag ?? tagName(record.pr, record.candidate_sha), already_promoted: already, pending: record.pending as Followup[] };
+}
+
+export async function promote(request: PromoteRequest, deps: PromotionDeps, depth = 0): Promise<Promoted | Refusal> {
   const { repo, repo_id: repoId, pr, candidate_sha: candidate } = request.subject;
   const log = (fields: Record<string, string | number | boolean | undefined>): void => deps.logger.log({ event: 'promote', repo, pr, candidate_sha: candidate, ...fields });
   try {
     const record = deps.store.get(pr);
     if (record === undefined) refuse('no_shadow');
     if (record.candidate_sha !== candidate) refuse('candidate_mismatch');
+    if (record.state === 'reconcile_conflict') refuse('reconcile_conflict');
     const api: Api = { fetcher: deps.fetcher, token: await deps.token(repoId), repo };
-    const main = await gh.getBranch(api, MAIN);
-    if (main === undefined) refuse('api_error', 'main does not exist');
 
-    if (record.state === 'promoted' || main === candidate) {
-      // Repeat after success: finish any follow-ups and report the existing promotion.
-      const base: ShadowRecord = record.state === 'promoted' ? record : { ...record, state: 'promoted', promoted_at: iso(deps.clock()), tag: tagName(pr, candidate), pending: [...FOLLOWUPS] };
+    if (record.state === 'advancing') {
+      const settled = await reconcile(api, deps, record);
+      if (settled.kind === 'promoted') return promotedResult(settled.record, true);
+      if (settled.kind === 'conflict') refuse('reconcile_conflict', `main is at ${settled.main.slice(0, 12)}`);
+      if (depth > 0) refuse('api_error', 'reconciliation did not settle');
+      return promote(request, deps, depth + 1);
+    }
+    if (record.state === 'promoted') {
       const pull = await gh.getPull(api, pr);
-      const done = await followups(api, deps, base, request, pull.title);
+      const done = await followups(api, deps, record, pull.title);
       log({ outcome: 'already_promoted', pending: done.pending.join(',') });
-      return { ok: true, status: 200, action: 'promote', main_sha: candidate, tag: done.tag ?? tagName(pr, candidate), already_promoted: true, pending: done.pending as Followup[] };
+      return promotedResult(done, true);
     }
 
+    const main = await gh.getBranch(api, MAIN);
+    if (main === undefined) refuse('api_error', 'main does not exist');
+    if (main === candidate) {
+      // Without a recorded intent the promoter did not move main here: never adopt it.
+      deps.store.put({ ...record, state: 'reconcile_conflict' });
+      log({ outcome: 'reconcile_conflict', severity: 'critical' });
+      refuse('reconcile_conflict', 'main is at the candidate without a recorded intent');
+    }
     const pull = await gh.getPull(api, pr);
     checkPull(pull, repoId, deps.ownerId, record.head_sha);
     const commit = await gh.getCommit(api, candidate);
@@ -234,27 +283,40 @@ export async function promote(request: PromoteRequest, deps: PromotionDeps): Pro
     if (commit.parents.length !== 1 || commit.parents[0] !== record.base_sha) refuse('candidate_mismatch', 'candidate parents changed');
 
     if (main !== record.base_sha) {
-      // `main` moved since the candidate was built. Rebuild on the new tip; the pipeline must run again.
       const rebuilt = await buildCandidate(api, deps, pull, repoId, record.head_sha);
       log({ outcome: 'stale_base', new_candidate_sha: rebuilt.candidate_sha });
       return refusal('stale_base', `main is at ${main.slice(0, 12)}`, rebuilt.candidate_sha);
     }
 
+    // Intent first: evidence and state are durable before main can move, and reconciliation is armed.
+    const evidence = canonicalJson(request.evidence as unknown as JsonValue);
+    const advancing: ShadowRecord = { ...record, state: 'advancing', evidence, promoted_at: iso(deps.clock()) };
+    deps.store.put(advancing);
+    await deps.schedule(deps.clock() + RECONCILE_AFTER_MS);
+
+    // Final check of the expected head immediately before the fast-forward-only update.
+    const finalMain = await gh.getBranch(api, MAIN);
+    if (finalMain !== record.base_sha) {
+      deps.store.put({ ...record, state: 'prepared', evidence: null });
+      log({ outcome: 'stale_base_at_update' });
+      return refusal('stale_base', `main moved to ${finalMain?.slice(0, 12) ?? 'nothing'} before the update`);
+    }
     if ((await gh.moveBranch(api, MAIN, candidate, false)) === 'not_fast_forward') {
+      deps.store.put({ ...record, state: 'prepared', evidence: null });
       log({ outcome: 'not_fast_forward' });
       return refusal('not_fast_forward');
     }
     const readback = await gh.getBranch(api, MAIN);
     if (readback !== candidate) {
+      // Leave the intent in place: reconciliation decides from main's state, never from this response.
       log({ outcome: 'readback_mismatch' });
       return refusal('readback_mismatch', `main reads ${readback?.slice(0, 12) ?? 'nothing'}`);
     }
-
-    const promoted: ShadowRecord = { ...record, state: 'promoted', promoted_at: iso(deps.clock()), tag: tagName(pr, candidate), pending: [...FOLLOWUPS] };
+    const promoted: ShadowRecord = { ...advancing, state: 'promoted', tag: tagName(pr, candidate), pending: [...FOLLOWUPS] };
     deps.store.put(promoted);
-    const done = await followups(api, deps, promoted, request, pull.title);
+    const done = await followups(api, deps, promoted, pull.title);
     log({ outcome: 'promoted', tag: done.tag ?? undefined, pending: done.pending.join(',') });
-    return { ok: true, status: 200, action: 'promote', main_sha: candidate, tag: done.tag ?? tagName(pr, candidate), already_promoted: false, pending: done.pending as Followup[] };
+    return promotedResult(done, false);
   } catch (error) {
     const result = toRefusal(error);
     log({ outcome: 'refused', code: result.code, detail: result.detail });
@@ -262,21 +324,26 @@ export async function promote(request: PromoteRequest, deps: PromotionDeps): Pro
   }
 }
 
-/**
- * Alarm path: retry follow-ups for promoted candidates. The tag needs the authorizer's evidence; when the
- * evidence is gone (the original call ended), a missing tag stays pending until the promote request is repeated.
- */
-export async function retryFollowups(repo: string, deps: PromotionDeps): Promise<number> {
-  let remaining = 0;
+/** Alarm path: settle in-flight updates, then retry follow-ups. Returns the number of open items. */
+export async function reconcileAll(repo: string, deps: PromotionDeps): Promise<number> {
+  let open = 0;
+  for (const record of deps.store.advancing()) {
+    try {
+      const api: Api = { fetcher: deps.fetcher, token: await deps.token(record.repo_id), repo };
+      const settled = await reconcile(api, deps, record);
+      if (settled.kind === 'promoted') open += settled.record.pending.length;
+    } catch {
+      open += 1;
+    }
+  }
   for (const record of deps.store.pendingFollowups()) {
     try {
       const api: Api = { fetcher: deps.fetcher, token: await deps.token(record.repo_id), repo };
       const pull = await gh.getPull(api, record.pr);
-      const done = await followups(api, deps, record, undefined, pull.title);
-      remaining += done.pending.length;
+      open += (await followups(api, deps, record, pull.title)).pending.length;
     } catch {
-      remaining += record.pending.length;
+      open += record.pending.length;
     }
   }
-  return remaining;
+  return open;
 }

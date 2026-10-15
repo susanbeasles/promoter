@@ -91,7 +91,7 @@ export class FakeGitHub {
   }
 
   readonly fetcher: Fetcher = async (url: string, init: HttpRequestInit): Promise<HttpResponseLike> => {
-    if (init.redirect !== 'error') throw new Error('promoter must refuse redirects');
+    if (init.redirect !== 'manual') throw new Error("promoter must fetch with redirect: 'manual' (workerd rejects 'error')");
     const parsed = new URL(url);
     if (parsed.origin !== 'https://api.github.com') throw new Error(`unexpected origin ${parsed.origin}`);
     const body: unknown = init.body === undefined ? undefined : JSON.parse(init.body);

@@ -1,5 +1,6 @@
-// The one way out of this Worker: fetch with `redirect: 'error'`, a timeout, a bounded body and a fatal
-// JSON decode. Errors carry a reason and nothing from the request: no URL, no headers, no body.
+// The one way out of this Worker: fetch with `redirect: 'manual'` (any 3xx is a failure), a timeout, a bounded
+// body and a fatal JSON decode. workerd rejects `redirect: 'error'` outright ("won't be implemented … use
+// 'manual' and check the response status code"), so 'manual' plus the status check is the only correct form. Errors carry a reason and nothing from the request: no URL, no headers, no body.
 
 import { concatBytes, decodeJson, DecodeError } from './decode.ts';
 
@@ -18,7 +19,7 @@ export interface HttpRequestInit {
   readonly method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   readonly headers: Readonly<Record<string, string>>;
   readonly body?: string;
-  readonly redirect: 'error';
+  readonly redirect: 'manual';
   readonly signal: AbortSignal;
 }
 
@@ -72,13 +73,12 @@ function classify(error: unknown): HttpFailure {
   if (error instanceof HttpError) return error.reason;
   if (error instanceof Error) {
     if (error.name === 'TimeoutError' || error.name === 'AbortError') return 'timeout';
-    if (/redirect/i.test(error.message)) return 'redirect';
   }
   return 'network';
 }
 
 /**
- * One JSON request. Never follows a redirect (a 3xx rejects), never waits longer than `timeoutMs`, never reads
+ * One JSON request. Never follows a redirect (any 3xx is refused unread), never waits longer than `timeoutMs`, never reads
  * more than `maxBodyBytes`, never accepts a body that is not valid UTF-8 JSON. The returned status is the
  * caller's to interpret.
  */
@@ -92,19 +92,21 @@ export async function fetchJson(
     method: init.method,
     headers: init.headers,
     ...(init.body === undefined ? {} : { body: init.body }),
-    redirect: 'error',
+    redirect: 'manual',
     signal: AbortSignal.timeout(limits.timeoutMs),
   };
   let response: HttpResponseLike;
   let bytes: Uint8Array;
   try {
     response = await fetcher(url, request);
+    if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new HttpError('redirect');
+    }
     bytes = await readBounded(response.body, limits.maxBodyBytes);
   } catch (error) {
     throw new HttpError(classify(error));
   }
-  // A 3xx must never arrive here (redirect: 'error' rejects), but a fetcher that disobeys is still refused.
-  if (response.status >= 300 && response.status < 400) throw new HttpError('redirect');
   if (bytes.byteLength === 0) return { status: response.status, body: null };
   try {
     return { status: response.status, body: decodeJson(bytes, limits.maxBodyBytes) };

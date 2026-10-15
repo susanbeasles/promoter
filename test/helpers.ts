@@ -65,10 +65,10 @@ export const prepareRequest = (headSha: string, pr = 7): PrepareRequest => ({
   requested_by: { sub: 'repo:susanbeasles/deployer:pull_request', run_id: '101' },
 });
 
-export const promoteRequest = (candidateSha: string, pr = 7): PromoteRequest => ({
+export const promoteRequest = (candidateSha: string, headSha: string, pr = 7): PromoteRequest => ({
   v: 1,
   action: 'promote',
-  subject: { repo: REPO, repo_id: REPO_ID, pr, candidate_sha: candidateSha },
+  subject: { repo: REPO, repo_id: REPO_ID, pr, candidate_sha: candidateSha, head_sha: headSha },
   evidence: {
     checks: [
       { name: 'pipeline / lint-test', id: 11, conclusion: 'success', completed_at: '2026-10-15T11:58:00Z' },

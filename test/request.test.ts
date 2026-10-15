@@ -20,14 +20,14 @@ test('valid prepare and promote requests parse and freeze', () => {
   const p = validateRequest(clone(prepareRequest('a'.repeat(40))), OWNER);
   assert.equal(p.action, 'shadow.prepare');
   assert.ok(Object.isFrozen(p) && Object.isFrozen(p.subject));
-  const q = validateRequest(clone(promoteRequest('b'.repeat(40))), OWNER);
+  const q = validateRequest(clone(promoteRequest('b'.repeat(40), 'c'.repeat(40))), OWNER);
   assert.equal(q.action, 'promote');
   if (q.action === 'promote') assert.equal(q.evidence.checks.length, 2);
 });
 
 test('every malformed request has a stable code', () => {
   const prep = () => clone(prepareRequest('a'.repeat(40)));
-  const prom = () => clone(promoteRequest('b'.repeat(40)));
+  const prom = () => clone(promoteRequest('b'.repeat(40), 'c'.repeat(40)));
   const cases: [string, any][] = [
     ['bad_shape', []],
     ['bad_action', { ...prep(), action: 'merge' }],
@@ -38,6 +38,8 @@ test('every malformed request has a stable code', () => {
     ['bad_repo', { ...prep(), subject: { ...prep().subject, repo: 'susanbeasles/a/b' } }],
     ['bad_repo_id', { ...prep(), subject: { ...prep().subject, repo_id: '1' } }],
     ['bad_pr', { ...prep(), subject: { ...prep().subject, pr: 0 } }],
+    ['bad_subject', (() => { const v = prom(); delete v.subject.head_sha; return v; })()],
+    ['bad_sha', { ...prom(), subject: { ...prom().subject, head_sha: 'C'.repeat(40) } }],
     ['bad_sha', { ...prep(), subject: { ...prep().subject, head_sha: 'A'.repeat(40) } }],
     ['unknown_key', { ...prep(), subject: { ...prep().subject, candidate_sha: 'a'.repeat(40) } }],
     ['bad_requested_by', { ...prep(), requested_by: { sub: 'x y' } }],

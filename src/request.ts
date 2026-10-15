@@ -50,7 +50,8 @@ export interface Evidence {
 export interface PromoteRequest {
   readonly v: 1;
   readonly action: 'promote';
-  readonly subject: Target & { readonly candidate_sha: string };
+  /** `head_sha` is the PR head the authorizer verified the evidence against (ADR-0002 section 2.5). */
+  readonly subject: Target & { readonly candidate_sha: string; readonly head_sha: string };
   readonly evidence: Evidence;
   readonly requested_by: RequestedBy;
 }
@@ -184,11 +185,15 @@ export function validateRequest(value: unknown, owner: string): PromotionRequest
     if (value['v'] !== 1) refuse('bad_version');
     const subject = value['subject'];
     if (!isPlainObject(subject)) refuse('bad_subject');
-    exactKeys(subject, ['repo', 'repo_id', 'pr', 'candidate_sha'], [], 'bad_subject');
+    exactKeys(subject, ['repo', 'repo_id', 'pr', 'candidate_sha', 'head_sha'], [], 'bad_subject');
     return Object.freeze({
       v: 1,
       action,
-      subject: Object.freeze({ ...target(subject, owner), candidate_sha: sha(subject['candidate_sha'], 'candidate_sha') }),
+      subject: Object.freeze({
+        ...target(subject, owner),
+        candidate_sha: sha(subject['candidate_sha'], 'candidate_sha'),
+        head_sha: sha(subject['head_sha'], 'head_sha'),
+      }),
       evidence: evidence(value['evidence']),
       requested_by: requestedBy(value['requested_by']),
     });

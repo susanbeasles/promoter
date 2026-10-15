@@ -250,6 +250,8 @@ export async function promote(request: PromoteRequest, deps: PromotionDeps, dept
     const record = deps.store.get(pr);
     if (record === undefined) refuse('no_shadow');
     if (record.candidate_sha !== candidate) refuse('candidate_mismatch');
+    // The authorizer verified its evidence against this PR head; it must be the head this candidate was built from.
+    if (record.head_sha !== request.subject.head_sha) refuse('head_moved', 'authorized head is not the prepared head');
     if (record.state === 'reconcile_conflict') refuse('reconcile_conflict');
     const api: Api = { fetcher: deps.fetcher, token: await deps.token(repoId), repo };
 

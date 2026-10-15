@@ -155,7 +155,7 @@ test('workerd: prepare then promote fast-forwards main, tags, and every GitHub c
     const prepared = await rt.call('prepare', prepareRequest(w.head));
     assert.equal(prepared.ok, true, JSON.stringify(prepared));
     assert.equal(w.gh.branch('shadow/pr-7'), prepared.candidate_sha);
-    const promoted = await rt.call('promote', promoteRequest(prepared.candidate_sha));
+    const promoted = await rt.call('promote', promoteRequest(prepared.candidate_sha, w.head));
     assert.equal(promoted.ok, true, JSON.stringify(promoted));
     assert.equal(w.gh.branch('main'), prepared.candidate_sha);
     assert.deepEqual(promoted.pending, []);
@@ -173,8 +173,8 @@ test('workerd: replay of the same promotion is idempotent: one ref move, one tag
   const rt = await boot(w);
   try {
     const prepared = await rt.call('prepare', prepareRequest(w.head));
-    const first = await rt.call('promote', promoteRequest(prepared.candidate_sha));
-    const again = await rt.call('promote', promoteRequest(prepared.candidate_sha));
+    const first = await rt.call('promote', promoteRequest(prepared.candidate_sha, w.head));
+    const again = await rt.call('promote', promoteRequest(prepared.candidate_sha, w.head));
     assert.equal(first.already_promoted, false);
     assert.equal(again.ok, true);
     assert.equal(again.already_promoted, true);
@@ -188,7 +188,7 @@ test('workerd: concurrent promotions of the same candidate serialize in the Dura
   const rt = await boot(w);
   try {
     const prepared = await rt.call('prepare', prepareRequest(w.head));
-    const results = await Promise.all([1, 2, 3].map(() => rt.call('promote', promoteRequest(prepared.candidate_sha))));
+    const results = await Promise.all([1, 2, 3].map(() => rt.call('promote', promoteRequest(prepared.candidate_sha, w.head))));
     assert.ok(results.every((r) => r.ok === true), JSON.stringify(results));
     assert.equal(results.filter((r) => r.already_promoted === false).length, 1);
     assert.equal(pulls(w).length, 1);
@@ -205,7 +205,7 @@ test('workerd: a PR head that moved after prepare is refused and main does not m
     const pull = w.gh.pulls.get(7);
     assert.ok(pull);
     pull.head = w.gh.commit('tree-pushed-later', [w.head], 'fix: late push');
-    const refused = await rt.call('promote', promoteRequest(prepared.candidate_sha));
+    const refused = await rt.call('promote', promoteRequest(prepared.candidate_sha, w.head));
     assert.equal(refused.ok, false);
     assert.equal(refused.code, 'head_moved');
     assert.equal(w.gh.branch('main'), w.main);
@@ -220,13 +220,13 @@ test('workerd: stale main refuses with a rebuilt candidate; the old candidate ca
     const prepared = await rt.call('prepare', prepareRequest(w.head));
     const moved = w.gh.commit('tree-other-merge', [w.main], 'feat: someone else landed');
     w.gh.refs.set('heads/main', { type: 'commit', sha: moved });
-    const stale = await rt.call('promote', promoteRequest(prepared.candidate_sha));
+    const stale = await rt.call('promote', promoteRequest(prepared.candidate_sha, w.head));
     assert.equal(stale.ok, false);
     assert.equal(stale.code, 'stale_base');
     assert.match(stale.candidate_sha, /^[0-9a-f]{40}$/);
     assert.notEqual(stale.candidate_sha, prepared.candidate_sha);
     assert.equal(w.gh.branch('main'), moved);
-    const old = await rt.call('promote', promoteRequest(prepared.candidate_sha));
+    const old = await rt.call('promote', promoteRequest(prepared.candidate_sha, w.head));
     assert.equal(old.ok, false);
     assert.equal(w.gh.branch('main'), moved, 'the stale candidate never lands');
   } finally { await rt.dispose(); cleanup(w); }
@@ -238,12 +238,12 @@ test('workerd: partial failure after main moved stays pending and a retry comple
   try {
     const prepared = await rt.call('prepare', prepareRequest(w.head));
     w.gh.fail('POST', /\/issues\/7\/comments$/, 502, true);
-    const first = await rt.call('promote', promoteRequest(prepared.candidate_sha));
+    const first = await rt.call('promote', promoteRequest(prepared.candidate_sha, w.head));
     assert.equal(first.ok, true);
     assert.ok(first.pending.includes('comment'), JSON.stringify(first));
     assert.equal(w.gh.branch('main'), prepared.candidate_sha);
     w.gh.failures.length = 0;
-    const retry = await rt.call('promote', promoteRequest(prepared.candidate_sha));
+    const retry = await rt.call('promote', promoteRequest(prepared.candidate_sha, w.head));
     assert.equal(retry.ok, true);
     assert.deepEqual(retry.pending, []);
     assert.equal(w.gh.comments.length, 1);
@@ -257,14 +257,14 @@ test('workerd crash: killed after main advanced and before the tag; a fresh runt
   try {
     const prepared = await rt.call('prepare', prepareRequest(w.head));
     w.crashOnMainUpdate = true;
-    const outcome = await rt.call('promote', promoteRequest(prepared.candidate_sha));
+    const outcome = await rt.call('promote', promoteRequest(prepared.candidate_sha, w.head));
     assert.equal(outcome, 'crashed');
     assert.equal(w.gh.branch('main'), prepared.candidate_sha, 'GitHub applied the update before the crash');
     assert.equal(w.gh.tags.size, 0, 'no tag was written before the crash');
 
     rt = await boot(w);
     // A later request carrying different evidence must not change what the tag records.
-    const forged = promoteRequest(prepared.candidate_sha);
+    const forged = promoteRequest(prepared.candidate_sha, w.head);
     const different = { ...forged, evidence: { ...forged.evidence, decision_id: 'dec_ffffffffffffffff', shadow_run_id: 999 } };
     const settled = await rt.call('promote', different);
     assert.equal(settled.ok, true, JSON.stringify(settled));
@@ -283,7 +283,7 @@ test('workerd crash: after the restart, prepare settles the in-flight promotion 
   try {
     const prepared = await rt.call('prepare', prepareRequest(w.head));
     w.crashOnMainUpdate = true;
-    assert.equal(await rt.call('promote', promoteRequest(prepared.candidate_sha)), 'crashed');
+    assert.equal(await rt.call('promote', promoteRequest(prepared.candidate_sha, w.head)), 'crashed');
     rt = await boot(w);
     const again = await rt.call('prepare', prepareRequest(w.head));
     assert.equal(again.ok, false);

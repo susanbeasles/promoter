@@ -24,7 +24,7 @@ test('tag names are stable and short', () => {
 });
 
 test('the tag message carries canonical JSON and its digest; any edit is detected', async () => {
-  const input = { repo: 'susanbeasles/x', record, prTitle: 'feat: y', evidence: promoteRequest(record.candidate_sha).evidence, promotedAt: record.promoted_at!, promoterVersion: '0.2.0' };
+  const input = { repo: 'susanbeasles/x', record, prTitle: 'feat: y', evidence: promoteRequest(record.candidate_sha, record.head_sha).evidence, promotedAt: record.promoted_at!, promoterVersion: '0.2.0' };
   const { message, sha256 } = await tagMessage(input);
   assert.match(message, /^Promote PR #42 to main as 0123456789ab\n\n\{"attestations":/);
   assert.ok(message.trimEnd().endsWith(`sha256:${sha256}`));

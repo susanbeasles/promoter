@@ -1,0 +1,36 @@
+// promoter: reachable only over the authorizer's service binding. No route, no workers.dev, no preview URL.
+// Routes and custom domains belong to `infra`; this file never carries them.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "promoter",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["global_fetch_strictly_public"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    // Numeric ids of the promoter GitHub App and its installation on the owner's account. Placeholders
+    // ("0") are refused at runtime with `bad_config`; the real values land here by pull request once the
+    // App exists. They are identifiers, not secrets.
+    "GITHUB_APP_ID": "0",
+    "GITHUB_APP_INSTALLATION_ID": "0",
+    "GH_OWNER": "susanbeasles",
+    "GH_OWNER_ID": "215839550"
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "LEDGER", "class_name": "PromotionLedger" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PromotionLedger"] }],
+  "secrets_store_secrets": [
+    {
+      // The App's private key as an unencrypted PKCS#8 PEM. The account has one store, so the store-level
+      // name is prefixed to stay distinct from the authorizer's and deployer's App keys.
+      "binding": "GITHUB_APP_KEY",
+      "store_id": "b6504fe2d5f64352954629bc7185fb79",
+      "secret_name": "PROMOTER_APP_KEY"
+    }
+  ]
+}

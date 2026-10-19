@@ -170,6 +170,9 @@ function persistedEvidence(record: ShadowRecord): Evidence {
 /** Run the steps that follow a successful fast-forward. Each is idempotent; failures stay pending. */
 async function followups(api: Api, deps: PromotionDeps, record: ShadowRecord): Promise<ShadowRecord> {
   let pending = [...record.pending] as Followup[];
+  // Older code may have cleared tag after accepting unverified provenance. Keep legacy recovery
+  // blocking even when its old pending list says the tag step already completed.
+  if (record.provenance_message === null && !pending.includes('tag')) pending.unshift('tag');
   const tag = record.tag ?? tagName(record.pr, record.candidate_sha);
   const attempt = async (step: Followup, run: () => Promise<void>): Promise<void> => {
     if (!pending.includes(step)) return;

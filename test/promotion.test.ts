@@ -541,3 +541,28 @@ for (const mismatch of ['none', 'internal-name', 'object-sha', 'message', 'neste
     assert.equal(h.gh.pulls.get(7)?.state, mismatch === 'none' ? 'closed' : 'open');
   });
 }
+
+test('legacy promoted row without a pending tag cannot close or clean up without persisted provenance', async () => {
+  const h = harness();
+  const p = await prepared(h);
+  h.gh.refs.set('heads/main', { type: 'commit', sha: p.candidate_sha });
+  h.gh.refs.set(`tags/${tagName(7, p.candidate_sha)}`, { type: 'commit', sha: p.candidate_sha });
+  h.deps.store.put({ ...h.deps.store.get(7)!, state: 'promoted', promoted_at: '2026-10-15T12:00:00Z', evidence: JSON.stringify(promoteRequest(p.candidate_sha, h.head).evidence), provenance_message: null, pending: ['close', 'cleanup'] });
+  const r = await promote(promoteRequest(p.candidate_sha, h.head), h.deps);
+  assert.equal(r.ok, true);
+  if (r.ok && r.action === 'promote') assert.deepEqual([...r.pending].sort(), ['cleanup', 'close', 'tag']);
+  assert.equal(h.gh.pulls.get(7)?.state, 'open');
+  assert.equal(h.gh.branch('shadow/pr-7'), p.candidate_sha);
+  assert.ok(h.deps.store.get(7)?.pending.includes('tag'), 'trusted recovery remains scheduled');
+});
+
+test('legacy alarm retry without a pending tag retains provenance and cleanup work', async () => {
+  const h = harness();
+  const p = await prepared(h);
+  h.gh.refs.set('heads/main', { type: 'commit', sha: p.candidate_sha });
+  h.deps.store.put({ ...h.deps.store.get(7)!, state: 'promoted', promoted_at: '2026-10-15T12:00:00Z', evidence: JSON.stringify(promoteRequest(p.candidate_sha, h.head).evidence), provenance_message: null, pending: ['close', 'cleanup'] });
+  assert.equal(await reconcileAll(REPO, h.deps), 3);
+  assert.equal(h.gh.pulls.get(7)?.state, 'open');
+  assert.equal(h.gh.branch('shadow/pr-7'), p.candidate_sha);
+  assert.deepEqual([...h.deps.store.get(7)!.pending].sort(), ['cleanup', 'close', 'tag']);
+});

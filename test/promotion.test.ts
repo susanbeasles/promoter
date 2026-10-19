@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { candidateMessage, prepare, promote, reconcileAll, shadowBranch } from '../src/promotion.ts';
-import { readTagMessage, tagName } from '../src/provenance.ts';
+import { candidateMessage, prepare, promote, reconcileAll, shadowBranch, PROMOTER_VERSION } from '../src/promotion.ts';
+import { readTagMessage, tagName, tagMessage } from '../src/provenance.ts';
 import { OWNER_ID, REPO, REPO_ID, treeSha } from './fake-github.ts';
 import { harness, prepareRequest, promoteRequest, TOKEN } from './helpers.ts';
 
@@ -416,4 +416,153 @@ test('candidate message bounds the body and keeps trailers', () => {
   assert.match(msg, /^x y \(#3\)\n/);
   assert.match(msg, /\[body truncated by promoter\]/);
   assert.match(msg, /Co-authored-by: dependabot\[bot\] <49699333\+dependabot\[bot\]@users\.noreply\.github\.com>\n$/);
+});
+
+// csf_8a636cf8ed5475f8c5ec10c6: mutable shadow refs must not supply a different merge base.
+test('prepare refuses a shadow ref rewritten between reset and merge without storing a candidate', async () => {
+  const h = harness();
+  h.gh.after = (call) => {
+    if (call.method === 'POST' && call.path.endsWith('/git/refs')) {
+      const injected = h.gh.commit('unreviewed-tree', [h.main], 'unreviewed');
+      h.gh.refs.set('heads/shadow/pr-7', { type: 'commit', sha: injected });
+      h.gh.after = undefined;
+    }
+  };
+  const r = await prepare(prepareRequest(h.head), h.deps);
+  assert.equal(r.ok, false);
+  assert.equal(h.deps.store.get(7), undefined);
+  assert.equal(h.gh.calls.some((c) => c.method === 'POST' && c.path.endsWith('/git/commits')), false);
+  assert.equal(h.gh.branch('main'), h.main);
+});
+
+for (const corruption of ['parents', 'tree', 'sha', 'missing'] as const) {
+  test(`prepare verifies merge commit readback: ${corruption}`, async () => {
+    const h = harness();
+    const fetcher = h.deps.fetcher;
+    h.deps = { ...h.deps, fetcher: async (url, init) => {
+      const response = await fetcher(url, init);
+      if (init.method !== 'GET' || !url.includes('/git/commits/')) return response;
+      if (corruption === 'missing') return new Response('{}', { status: 404 });
+      const body = await new Response(response.body).json();
+      if (corruption === 'parents') body.parents = [{ sha: h.head }, { sha: h.main }];
+      if (corruption === 'tree') body.tree.sha = 'a'.repeat(40);
+      if (corruption === 'sha') body.sha = 'b'.repeat(40);
+      return new Response(JSON.stringify(body), { status: 200 });
+    } };
+    const r = await prepare(prepareRequest(h.head), h.deps);
+    assert.equal(r.ok, false);
+    assert.equal(h.deps.store.get(7), undefined);
+    assert.equal(h.gh.calls.some((c) => c.method === 'POST' && c.path.endsWith('/git/commits')), false);
+  });
+}
+
+// csf_aa1e0ac73c08c7e94fa23f21: only exact, positively read back annotated provenance completes tagging.
+for (const kind of ['lightweight', 'forged-message', 'wrong-name'] as const) {
+  test(`provenance remains pending for an existing ${kind} tag at the candidate`, async () => {
+    const h = harness();
+    const p = await prepared(h);
+    const name = tagName(7, p.candidate_sha);
+    if (kind === 'lightweight') h.gh.refs.set(`tags/${name}`, { type: 'commit', sha: p.candidate_sha });
+    else {
+      const object = 'e'.repeat(40);
+      h.gh.tags.set(object, { tag: kind === 'wrong-name' ? 'forged-name' : name, message: 'forged provenance', object: p.candidate_sha });
+      h.gh.refs.set(`tags/${name}`, { type: 'tag', sha: object });
+    }
+    const r = await promote(promoteRequest(p.candidate_sha, h.head), h.deps);
+    assert.equal(r.ok, true);
+    if (r.ok && r.action === 'promote') assert.deepEqual([...r.pending].sort(), ['cleanup', 'close', 'tag']);
+    assert.equal(h.gh.pulls.get(7)?.state, 'open');
+    assert.equal(h.gh.branch('shadow/pr-7'), p.candidate_sha);
+  });
+}
+
+for (const status of [201, 422]) {
+  test(`tag ref response ${status} followed by absent readback never completes provenance`, async () => {
+    const h = harness();
+    const p = await prepared(h);
+    if (status === 422) h.gh.fail('POST', /\/git\/refs$/, 422);
+    else h.gh.after = (call) => {
+      if (call.method === 'POST' && call.path.endsWith('/git/refs')) h.gh.refs.delete(`tags/${tagName(7, p.candidate_sha)}`);
+    };
+    const r = await promote(promoteRequest(p.candidate_sha, h.head), h.deps);
+    assert.equal(r.ok, true);
+    if (r.ok && r.action === 'promote') assert.deepEqual([...r.pending].sort(), ['cleanup', 'close', 'tag']);
+    assert.equal(h.gh.pulls.get(7)?.state, 'open');
+    assert.equal(h.gh.branch('shadow/pr-7'), p.candidate_sha);
+  });
+}
+
+test('a retry verifies the original persisted provenance after the PR title changes', async () => {
+  const h = harness();
+  const p = await prepared(h);
+  h.gh.fail('GET', /\/git\/ref\/tags\//, 502);
+  await promote(promoteRequest(p.candidate_sha, h.head), h.deps);
+  const r = h.deps.store.get(7)!;
+  assert.ok(r.pending.includes('tag'));
+  const original = h.gh.tags.values().next().value?.message;
+  h.gh.pulls.get(7)!.title = 'changed after promotion';
+  assert.equal(await reconcileAll(REPO, h.deps), 0);
+  // If the first attempt failed before creating a tag, persistence still fixes the expected title.
+  const message = [...h.gh.tags.values()].at(-1)!.message;
+  assert.equal((await readTagMessage(message))?.['pr_title'], 'feat: add thing');
+  if (original !== undefined) assert.equal(message, original);
+});
+
+for (const mismatch of ['none', 'internal-name', 'object-sha', 'message', 'nested-tag'] as const) {
+  test(`pre-existing annotated provenance is accepted only when all canonical fields match: ${mismatch}`, async () => {
+    const h = harness();
+    const now = Date.parse('2026-10-15T12:00:00Z');
+    h.deps = { ...h.deps, clock: () => now };
+    const p = await prepared(h);
+    const name = tagName(7, p.candidate_sha);
+    const objectSha = 'e'.repeat(40);
+    const { message } = await tagMessage({
+      repo: REPO, record: h.deps.store.get(7)!, prTitle: 'feat: add thing',
+      evidence: promoteRequest(p.candidate_sha, h.head).evidence,
+      promotedAt: new Date(now).toISOString(), promoterVersion: PROMOTER_VERSION,
+    });
+    h.gh.tags.set(objectSha, { tag: mismatch === 'internal-name' ? 'other-tag' : name, message: mismatch === 'message' ? message + 'forged' : message, object: p.candidate_sha });
+    h.gh.refs.set(`tags/${name}`, { type: 'tag', sha: objectSha });
+    if (mismatch === 'object-sha' || mismatch === 'nested-tag') {
+      const fetcher = h.deps.fetcher;
+      h.deps = { ...h.deps, fetcher: async (url, init) => {
+        const response = await fetcher(url, init);
+        if (init.method !== 'GET' || !url.endsWith(`/git/tags/${objectSha}`)) return response;
+        const body = await new Response(response.body).json();
+        if (mismatch === 'object-sha') body.sha = 'f'.repeat(40);
+        else body.object.type = 'tag';
+        return new Response(JSON.stringify(body), { status: 200 });
+      } };
+    }
+    const r = await promote(promoteRequest(p.candidate_sha, h.head), h.deps);
+    assert.equal(r.ok, true);
+    if (r.ok && r.action === 'promote') assert.deepEqual([...r.pending].sort(), mismatch === 'none' ? [] : ['cleanup', 'close', 'tag']);
+    assert.equal(h.gh.tags.size, 1, 'an existing ref is never replaced');
+    assert.equal(h.gh.pulls.get(7)?.state, mismatch === 'none' ? 'closed' : 'open');
+  });
+}
+
+test('legacy promoted row without a pending tag cannot close or clean up without persisted provenance', async () => {
+  const h = harness();
+  const p = await prepared(h);
+  h.gh.refs.set('heads/main', { type: 'commit', sha: p.candidate_sha });
+  h.gh.refs.set(`tags/${tagName(7, p.candidate_sha)}`, { type: 'commit', sha: p.candidate_sha });
+  h.deps.store.put({ ...h.deps.store.get(7)!, state: 'promoted', promoted_at: '2026-10-15T12:00:00Z', evidence: JSON.stringify(promoteRequest(p.candidate_sha, h.head).evidence), provenance_message: null, pending: ['close', 'cleanup'] });
+  const r = await promote(promoteRequest(p.candidate_sha, h.head), h.deps);
+  assert.equal(r.ok, true);
+  if (r.ok && r.action === 'promote') assert.deepEqual([...r.pending].sort(), ['cleanup', 'close', 'tag']);
+  assert.equal(h.gh.pulls.get(7)?.state, 'open');
+  assert.equal(h.gh.branch('shadow/pr-7'), p.candidate_sha);
+  assert.ok(h.deps.store.get(7)?.pending.includes('tag'), 'trusted recovery remains scheduled');
+});
+
+test('legacy alarm retry without a pending tag retains provenance and cleanup work', async () => {
+  const h = harness();
+  const p = await prepared(h);
+  h.gh.refs.set('heads/main', { type: 'commit', sha: p.candidate_sha });
+  h.deps.store.put({ ...h.deps.store.get(7)!, state: 'promoted', promoted_at: '2026-10-15T12:00:00Z', evidence: JSON.stringify(promoteRequest(p.candidate_sha, h.head).evidence), provenance_message: null, pending: ['close', 'cleanup'] });
+  assert.equal(await reconcileAll(REPO, h.deps), 3);
+  assert.equal(h.gh.pulls.get(7)?.state, 'open');
+  assert.equal(h.gh.branch('shadow/pr-7'), p.candidate_sha);
+  assert.deepEqual([...h.deps.store.get(7)!.pending].sort(), ['cleanup', 'close', 'tag']);
 });

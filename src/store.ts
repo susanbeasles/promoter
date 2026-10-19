@@ -20,6 +20,8 @@ export interface ShadowRecord {
   readonly pending: readonly string[];
   /** The authorizer's evidence (canonical JSON), persisted before `main` moves; the tag is built only from it. */
   readonly evidence: string | null;
+  /** Exact canonical tag message persisted before main moves, null on legacy/prepared records. */
+  readonly provenance_message: string | null;
 }
 
 export interface ShadowStore {
@@ -48,7 +50,8 @@ export const SHADOW_SCHEMA = `CREATE TABLE IF NOT EXISTS shadow (
   promoted_at TEXT,
   tag TEXT,
   pending TEXT NOT NULL DEFAULT '[]',
-  evidence TEXT
+  evidence TEXT,
+  provenance_message TEXT
 )`;
 
 interface Row extends Record<string, SqlValue> {
@@ -64,6 +67,7 @@ interface Row extends Record<string, SqlValue> {
   tag: string | null;
   pending: string;
   evidence: string | null;
+  provenance_message: string | null;
 }
 
 function toRecord(row: Row): ShadowRecord {
@@ -80,6 +84,9 @@ export class SqlShadowStore implements ShadowStore {
     this.#sql = sql;
     this.#repoId = repoId;
     this.#sql.exec(SHADOW_SCHEMA);
+    if (this.#sql.exec("SELECT name FROM pragma_table_info('shadow') WHERE name = 'provenance_message'").toArray().length === 0) {
+      this.#sql.exec('ALTER TABLE shadow ADD COLUMN provenance_message TEXT');
+    }
   }
   get(pr: number): ShadowRecord | undefined {
     const row = this.#sql.exec<Row>('SELECT * FROM shadow WHERE pr = ?', pr).toArray()[0];
@@ -90,11 +97,11 @@ export class SqlShadowStore implements ShadowStore {
   put(record: ShadowRecord): void {
     if (record.repo_id !== this.#repoId) throw new Error('shadow store belongs to another repository');
     this.#sql.exec(
-      `INSERT INTO shadow (pr, repo_id, head_sha, base_sha, tree_sha, candidate_sha, state, prepared_at, promoted_at, tag, pending, evidence)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO shadow (pr, repo_id, head_sha, base_sha, tree_sha, candidate_sha, state, prepared_at, promoted_at, tag, pending, evidence, provenance_message)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(pr) DO UPDATE SET head_sha = excluded.head_sha, base_sha = excluded.base_sha, tree_sha = excluded.tree_sha,
          candidate_sha = excluded.candidate_sha, state = excluded.state, prepared_at = excluded.prepared_at,
-         promoted_at = excluded.promoted_at, tag = excluded.tag, pending = excluded.pending, evidence = excluded.evidence`,
+         promoted_at = excluded.promoted_at, tag = excluded.tag, pending = excluded.pending, evidence = excluded.evidence, provenance_message = excluded.provenance_message`,
       record.pr,
       record.repo_id,
       record.head_sha,
@@ -107,6 +114,7 @@ export class SqlShadowStore implements ShadowStore {
       record.tag,
       JSON.stringify(record.pending),
       record.evidence,
+      record.provenance_message,
     );
   }
   advancing(): readonly ShadowRecord[] {

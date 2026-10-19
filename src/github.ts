@@ -189,13 +189,17 @@ export async function getTagRef(api: Api, tag: string): Promise<TagRefView | und
   return { type, sha: shaField(target, 'sha', 'tag ref') };
 }
 
-/** The commit an annotated tag object points at. */
-export async function getTagTarget(api: Api, tagObjectSha: string): Promise<string> {
+/** Read an annotated tag's immutable identity, internal name, message and direct commit target. */
+export async function getAnnotatedTag(api: Api, tagObjectSha: string): Promise<{ readonly sha: string; readonly tag: string; readonly message: string; readonly target: string }> {
   const res = await call(api, 'GET', `/git/tags/${tagObjectSha}`);
   if (res.status !== 200) refuse('api_error', describeStatus('tag object', res.status, res.body));
-  const target = object(object(res.body, 'tag object', 'root')['object'], 'tag object', 'object');
+  const b = object(res.body, 'tag object', 'root');
+  const target = object(b['object'], 'tag object', 'object');
   if (target['type'] !== 'commit') shape('tag object', 'object.type');
-  return shaField(target, 'sha', 'tag object');
+  const tag = b['tag'];
+  const message = b['message'];
+  if (typeof tag !== 'string' || typeof message !== 'string') shape('tag object', 'tag/message');
+  return { sha: shaField(b, 'sha', 'tag object'), tag, message, target: shaField(target, 'sha', 'tag object') };
 }
 
 export async function createAnnotatedTag(api: Api, tag: string, message: string, commit: string): Promise<string> {
